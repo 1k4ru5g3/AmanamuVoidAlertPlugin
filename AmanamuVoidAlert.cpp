@@ -3,27 +3,29 @@
 // POE2Fixer / POEFixer SDK v6 Plugin
 //
 // Funktion:
-// - Erkennt Monster, die den Buff "abyss_lightless_well..." haben.
-// - Merkt sich diese Monster per EntityId.
-// - Zeigt an:
-//      INSIDE CLOUD  = Monster hat aktuell den Lightless-Well-Buff
-//      OUTSIDE CLOUD = Monster wurde als Lightless/Amanamu erkannt,
-//                      hat den Buff aber aktuell nicht mehr
-// - Zeichnet On-Screen Marker und Off-Screen/Edge Pfeile.
-// - Debug-Fenster mit erkannten Entities/Buffs.
+// - Erkennt Amanamu/Lightless-Well-Monster sofort über MonsterMods / OMP:
+//      MonsterAbyssLightlessFaction1
+//      Metadata/Monsters/MonsterMods/LeagueAbyss/LightlessWells
+//      HASH16 0x63D1
+//      HASH32 0xBFDA2A36
 //
-// Änderungen:
-// - Pfeil kann jetzt auch angezeigt werden, wenn das Monster auf dem Bildschirm ist.
-// - Buff-Status wird direkt vor dem Zeichnen nochmal neu gescannt,
-//   damit INSIDE/OUTSIDE schneller aktualisiert.
+// - Erkennt zusätzlich den Cloud-Status über Buffs:
+//      INSIDE CLOUD  = Monster hat aktuell "abyss_lightless_well_immune..."
+//      OUTSIDE CLOUD = Monster hat den MonsterMod, aber nicht den Inside-Buff
+//
+// - Buff+Cache bleibt als Fallback erhalten.
+// - Zeichnet On-Screen Marker und Edge-Pfeile.
+// - Pfeil kann auch angezeigt werden, wenn Monster bereits sichtbar ist.
+// - Pfeilrichtung wird dynamisch aus Player -> Monster berechnet,
+//   über einen projizierten Proxy-Punkt nahe beim Spieler.
+// - Tote/despawned Monster werden schneller aus dem Cache entfernt.
+// - Debug-Fenster mit MonsterMods und Buffs.
 // ============================================================================
 
 #define NOMINMAX
 
 #include "sdk/PluginSDK.h"
 
-// Je nach Projekt-Setup kann einer dieser Includes passen.
-// Im ExamplePlugin ist ImGui bereits Teil des Projekts.
 // Falls "imgui/imgui.h" nicht gefunden wird, nimm stattdessen: #include "imgui.h"
 #include "imgui/imgui.h"
 
@@ -47,12 +49,12 @@ namespace
     constexpr const char* kBuffPrefixAbyssLightlessWell = "abyss_lightless_well";
     constexpr const char* kBuffInsideCloud = "abyss_lightless_well_immune";
 
-    // Deine gefundene Mod-ID aus mods.csv Row 14451.
-    // Aktuell nur Doku/Debug, weil SDK v6 in den sichtbaren Headern keinen
-    // Monster-OMP-Mod-Enumerator anbietet.
     constexpr const char* kExpectedMonsterModId = "MonsterAbyssLightlessFaction1";
     constexpr const char* kExpectedMonsterModMetadata =
         "Metadata/Monsters/MonsterMods/LeagueAbyss/LightlessWells";
+
+    constexpr uint16_t kExpectedMonsterModHash16 = 0x63D1;
+    constexpr uint32_t kExpectedMonsterModHash32 = 0xBFDA2A36;
 
     static std::string ToLower(std::string s)
     {
@@ -75,8 +77,10 @@ namespace
     {
         std::string out;
         out.reserve(ws.size());
+
         for (wchar_t c : ws)
             out.push_back(c < 128 ? static_cast<char>(c) : '?');
+
         return out;
     }
 
@@ -96,10 +100,15 @@ namespace
         return ImVec2(v.x / len, v.y / len);
     }
 
+    static bool IsUsableDirection(ImVec2 v)
+    {
+        return std::isfinite(v.x) &&
+            std::isfinite(v.y) &&
+            (std::abs(v.x) > 1.0f || std::abs(v.y) > 1.0f);
+    }
+
     static ImVec2 ClampToScreenEdge(ImVec2 center, ImVec2 dir, float width, float height, float margin)
     {
-        // Ray vom Bildschirmzentrum in Richtung dir bis Bildschirmrand.
-        // Danach etwas nach innen mit margin.
         dir = Normalize(dir);
 
         float tx = 999999.0f;
@@ -146,12 +155,27 @@ namespace
         uint32_t Id = 0;
         uintptr_t Address = 0;
         std::string Path;
+
         bool SeenThisFrame = false;
         bool InsideCloud = false;
         bool HasAnyLightlessBuff = false;
+        bool HasAmanamuMonsterMod = false;
+
         float Distance = 0.0f;
         float LastSeenSeconds = 0.0f;
+        float LastLiveEntitySeconds = 0.0f;
+        bool WasRecentlyLive = false;
+
+        float WorldX = 0.0f;
+        float WorldY = 0.0f;
+        float WorldZ = 0.0f;
+        float ModelBoundsZ = 80.0f;
+
+        bool HasLastScreenDirection = false;
+        ImVec2 LastScreenDirection = ImVec2(0.0f, -1.0f);
+
         std::vector<std::string> LastBuffs;
+        std::vector<std::string> LastMonsterMods;
     };
 }
 
@@ -196,7 +220,7 @@ public:
         ImGui::Checkbox("Enable overlay", &m_EnableOverlay);
         ImGui::Checkbox("Show debug window", &m_ShowDebugWindow);
         ImGui::Checkbox("Draw on-screen labels", &m_DrawOnScreenLabels);
-        ImGui::Checkbox("Draw off-screen arrows", &m_DrawOffscreenArrows);
+        ImGui::Checkbox("Draw off-screen / edge arrows", &m_DrawOffscreenArrows);
         ImGui::Checkbox("Draw edge arrow even when monster is on screen", &m_DrawEdgeArrowForOnScreenMonsters);
         ImGui::Checkbox("Draw circle around monster", &m_DrawCircle);
         ImGui::Checkbox("Only rare/unique monsters", &m_OnlyRareOrUnique);
@@ -205,17 +229,26 @@ public:
         ImGui::Separator();
 
         ImGui::SliderFloat("Max tracking distance", &m_MaxDistance, 500.0f, 8000.0f, "%.0f");
-        ImGui::SliderFloat("Forget after seconds", &m_ForgetAfterSeconds, 1.0f, 20.0f, "%.1f");
+        ImGui::SliderFloat("Forget after seconds", &m_ForgetAfterSeconds, 1.0f, 30.0f, "%.1f");
+        ImGui::SliderFloat("Forget missing live entity after seconds", &m_MissingEntityForgetSeconds, 0.2f, 5.0f, "%.2f");
         ImGui::SliderFloat("Label Y offset", &m_LabelYOffset, 20.0f, 140.0f, "%.0f");
         ImGui::SliderFloat("Circle radius", &m_CircleRadius, 12.0f, 80.0f, "%.0f");
+        ImGui::SliderFloat("Arrow edge margin", &m_ArrowEdgeMargin, 30.0f, 160.0f, "%.0f");
+        ImGui::SliderFloat("Proxy distance", &m_ProxyDistance, 200.0f, 2000.0f, "%.0f");
 
         ImGui::Separator();
 
-        ImGui::TextWrapped("Current detection:");
+        ImGui::TextWrapped("Primary detection:");
+        ImGui::BulletText("MonsterMod Id: %s", kExpectedMonsterModId);
+        ImGui::BulletText("MonsterMod Metadata: %s", kExpectedMonsterModMetadata);
+        ImGui::BulletText("MonsterMod Hash16: 0x%04X", static_cast<unsigned int>(kExpectedMonsterModHash16));
+        ImGui::BulletText("MonsterMod Hash32: 0x%08X", static_cast<unsigned int>(kExpectedMonsterModHash32));
+
+        ImGui::Separator();
+
+        ImGui::TextWrapped("Cloud status detection:");
         ImGui::BulletText("Inside cloud: monster buff contains '%s'", kBuffInsideCloud);
-        ImGui::BulletText("Known Amanamu monster: entity had any buff containing '%s'", kBuffPrefixAbyssLightlessWell);
-        ImGui::BulletText("Expected final mod id, if OMP becomes readable: %s", kExpectedMonsterModId);
-        ImGui::BulletText("Expected mod metadata: %s", kExpectedMonsterModMetadata);
+        ImGui::BulletText("Fallback known monster: entity had any buff containing '%s'", kBuffPrefixAbyssLightlessWell);
 
         if (ImGui::Button("Clear tracked monsters"))
             m_Tracked.clear();
@@ -244,7 +277,7 @@ public:
         PruneOld(now);
 
         if (m_EnableOverlay)
-            DrawOverlay(snapshot);
+            DrawOverlay(snapshot, now);
 
         if (m_ShowDebugWindow)
             DrawDebugWindow(snapshot);
@@ -272,8 +305,11 @@ public:
         file << "LogNewDetections=" << (m_LogNewDetections ? 1 : 0) << "\n";
         file << "MaxDistance=" << m_MaxDistance << "\n";
         file << "ForgetAfterSeconds=" << m_ForgetAfterSeconds << "\n";
+        file << "MissingEntityForgetSeconds=" << m_MissingEntityForgetSeconds << "\n";
         file << "LabelYOffset=" << m_LabelYOffset << "\n";
         file << "CircleRadius=" << m_CircleRadius << "\n";
+        file << "ArrowEdgeMargin=" << m_ArrowEdgeMargin << "\n";
+        file << "ProxyDistance=" << m_ProxyDistance << "\n";
     }
 
 private:
@@ -319,8 +355,11 @@ private:
                 else if (key == "LogNewDetections") m_LogNewDetections = b;
                 else if (key == "MaxDistance") m_MaxDistance = std::stof(value);
                 else if (key == "ForgetAfterSeconds") m_ForgetAfterSeconds = std::stof(value);
+                else if (key == "MissingEntityForgetSeconds") m_MissingEntityForgetSeconds = std::stof(value);
                 else if (key == "LabelYOffset") m_LabelYOffset = std::stof(value);
                 else if (key == "CircleRadius") m_CircleRadius = std::stof(value);
+                else if (key == "ArrowEdgeMargin") m_ArrowEdgeMargin = std::stof(value);
+                else if (key == "ProxyDistance") m_ProxyDistance = std::stof(value);
             }
             catch (...)
             {
@@ -352,7 +391,7 @@ private:
         if (m_OnlyRareOrUnique && e.Rarity < 2)
             return false;
 
-        if (!e.Components.HasBuffs())
+        if (!e.Components.HasBuffs() && !e.Components.HasOMP())
             return false;
 
         return true;
@@ -390,24 +429,192 @@ private:
         return result;
     }
 
+    bool HasAmanamuMonsterMod(const PluginSDK::Entity& e, std::vector<std::string>* debugMods = nullptr) const
+    {
+        if (!e.Components.HasOMP())
+            return false;
+
+        std::vector<PluginSDK::MonsterMod> mods =
+            ctx()->Components.EnumerateMonsterMods(e.Components.OMP);
+
+        bool found = false;
+
+        for (const PluginSDK::MonsterMod& mod : mods)
+        {
+            if (debugMods)
+            {
+                char line[768];
+                std::snprintf(
+                    line,
+                    sizeof(line),
+                    "%s | %s | %s | h16=0x%04X h32=0x%08X gen=%d",
+                    mod.Id.c_str(),
+                    mod.Name.c_str(),
+                    mod.Metadata.c_str(),
+                    static_cast<unsigned int>(mod.Hash16),
+                    static_cast<unsigned int>(mod.Hash32),
+                    static_cast<int>(mod.GenerationType)
+                );
+
+                debugMods->push_back(line);
+            }
+
+            if (mod.Id == kExpectedMonsterModId)
+                found = true;
+
+            if (mod.Metadata == kExpectedMonsterModMetadata)
+                found = true;
+
+            if (mod.Hash16 == kExpectedMonsterModHash16)
+                found = true;
+
+            if (mod.Hash32 == kExpectedMonsterModHash32)
+                found = true;
+        }
+
+        return found;
+    }
+
     bool HasInterestingStatsFallback(const PluginSDK::Entity& e) const
     {
-        // Optionaler Fallback/Debug:
-        // Row 4754 MonsterProximalTangibility1 hatte Stat1 = 19783.
-        // Das ist NICHT der von dir bevorzugte LightlessWells-Mod Row 14451,
-        // aber falls ein Monster diesen Stat in Components.Stats hat,
-        // kann man ihn testweise ebenfalls markieren.
-        //
-        // Default hier bewusst false lassen, weil false positives möglich sind.
-        // Zum Testen kannst du das aktivieren:
-        //
-        // for (auto s : ctx()->Components.EnumerateStats(e.Components.Stats))
-        //     if (s.Key == 19783) return true;
-        //
-        // return false;
-
         (void)e;
         return false;
+    }
+
+    void UpdateCachedScreenDirection(
+        TrackedMonster& tracked,
+        bool projectionReturned,
+        float sx,
+        float sy,
+        float screenW,
+        float screenH,
+        ImVec2 screenCenter)
+    {
+        if (!projectionReturned)
+            return;
+
+        if (!std::isfinite(sx) || !std::isfinite(sy))
+            return;
+
+        if (std::abs(sx) > screenW * 4.0f || std::abs(sy) > screenH * 4.0f)
+            return;
+
+        ImVec2 dir(sx - screenCenter.x, sy - screenCenter.y);
+
+        if (!IsUsableDirection(dir))
+            return;
+
+        tracked.LastScreenDirection = Normalize(dir);
+        tracked.HasLastScreenDirection = true;
+    }
+
+    ImVec2 GetArrowDirection(
+        const PluginSDK::Snapshot& snapshot,
+        TrackedMonster& tracked,
+        bool visibleOnScreen,
+        bool projectionReturned,
+        float sx,
+        float sy,
+        float worldX,
+        float worldY,
+        float worldZ,
+        float screenW,
+        float screenH,
+        ImVec2 screenCenter)
+    {
+        // Wenn Monster sichtbar ist, ist die direkte Screenposition perfekt.
+        if (visibleOnScreen)
+        {
+            ImVec2 dir(sx - screenCenter.x, sy - screenCenter.y);
+
+            if (IsUsableDirection(dir))
+            {
+                tracked.LastScreenDirection = Normalize(dir);
+                tracked.HasLastScreenDirection = true;
+                return Normalize(dir);
+            }
+        }
+
+        // Wenn WorldToScreen für das Monster brauchbare Offscreen-Koordinaten liefert,
+        // können wir diese ebenfalls direkt benutzen.
+        if (projectionReturned &&
+            std::isfinite(sx) &&
+            std::isfinite(sy) &&
+            std::abs(sx) < screenW * 4.0f &&
+            std::abs(sy) < screenH * 4.0f)
+        {
+            ImVec2 dir(sx - screenCenter.x, sy - screenCenter.y);
+
+            if (IsUsableDirection(dir))
+            {
+                tracked.LastScreenDirection = Normalize(dir);
+                tracked.HasLastScreenDirection = true;
+                return Normalize(dir);
+            }
+        }
+
+        // Haupt-Fallback:
+        // Richtung in der Welt berechnen: Player -> Monster.
+        const float dx = worldX - snapshot.Player.WorldX;
+        const float dy = worldY - snapshot.Player.WorldY;
+
+        const float len = std::sqrt(dx * dx + dy * dy);
+        if (len > 1.0f)
+        {
+            const float nx = dx / len;
+            const float ny = dy / len;
+
+            // Proxy-Punkt nahe beim Spieler in Richtung Monster.
+            // Dadurch ist der Punkt fast immer projizierbar,
+            // auch wenn das Monster selbst offscreen ist.
+            const float proxyX = snapshot.Player.WorldX + nx * m_ProxyDistance;
+            const float proxyY = snapshot.Player.WorldY + ny * m_ProxyDistance;
+            const float proxyZ = snapshot.Player.WorldZ + 80.0f;
+
+            float playerSx = 0.0f;
+            float playerSy = 0.0f;
+            float proxySx = 0.0f;
+            float proxySy = 0.0f;
+
+            const bool playerProjected = ctx()->Render.WorldToScreen(
+                snapshot.Player.WorldX,
+                snapshot.Player.WorldY,
+                snapshot.Player.WorldZ + 80.0f,
+                playerSx,
+                playerSy
+            );
+
+            const bool proxyProjected = ctx()->Render.WorldToScreen(
+                proxyX,
+                proxyY,
+                proxyZ,
+                proxySx,
+                proxySy
+            );
+
+            if (playerProjected &&
+                proxyProjected &&
+                std::isfinite(playerSx) &&
+                std::isfinite(playerSy) &&
+                std::isfinite(proxySx) &&
+                std::isfinite(proxySy))
+            {
+                ImVec2 dir(proxySx - playerSx, proxySy - playerSy);
+
+                if (IsUsableDirection(dir))
+                {
+                    tracked.LastScreenDirection = Normalize(dir);
+                    tracked.HasLastScreenDirection = true;
+                    return Normalize(dir);
+                }
+            }
+        }
+
+        // Letzter Notfall-Fallback.
+        if (tracked.HasLastScreenDirection)
+            return Normalize(tracked.LastScreenDirection);
+
+        return ImVec2(0.0f, -1.0f);
     }
 
     void ScanEntities(const PluginSDK::Snapshot& snapshot, float now)
@@ -425,13 +632,16 @@ private:
 
             BuffScanResult buffResult = ScanBuffs(e);
 
+            std::vector<std::string> monsterModDebug;
+            const bool foundByMonsterMod = HasAmanamuMonsterMod(e, &monsterModDebug);
+
             const bool foundByBuff = buffResult.HasAnyLightlessWellBuff;
             const bool foundByStatsFallback = HasInterestingStatsFallback(e);
 
             auto existingIt = m_Tracked.find(e.Id);
             const bool alreadyKnown = existingIt != m_Tracked.end();
 
-            if (!foundByBuff && !foundByStatsFallback && !alreadyKnown)
+            if (!foundByMonsterMod && !foundByBuff && !foundByStatsFallback && !alreadyKnown)
                 continue;
 
             const bool isNew = !alreadyKnown;
@@ -443,18 +653,34 @@ private:
             tracked.SeenThisFrame = true;
             tracked.Distance = distance;
             tracked.LastSeenSeconds = now;
+            tracked.LastLiveEntitySeconds = now;
+            tracked.WasRecentlyLive = true;
+
+            tracked.WorldX = e.WorldX;
+            tracked.WorldY = e.WorldY;
+            tracked.WorldZ = e.WorldZ;
+            tracked.ModelBoundsZ = std::max(e.ModelBoundsZ, 80.0f);
+
+            tracked.HasAmanamuMonsterMod = foundByMonsterMod || tracked.HasAmanamuMonsterMod;
             tracked.HasAnyLightlessBuff = buffResult.HasAnyLightlessWellBuff || tracked.HasAnyLightlessBuff;
+
             tracked.InsideCloud = buffResult.InsideCloud;
+
             tracked.LastBuffs = std::move(buffResult.BuffNames);
+
+            if (!monsterModDebug.empty())
+                tracked.LastMonsterMods = std::move(monsterModDebug);
 
             if (isNew && m_LogNewDetections)
             {
-                char msg[512];
+                char msg[768];
                 std::snprintf(
                     msg,
                     sizeof(msg),
-                    "Detected possible Amanamu/Lightless monster: id=%u path=%s",
+                    "Detected Amanamu/Lightless monster: id=%u byMod=%d byBuff=%d path=%s",
                     tracked.Id,
+                    foundByMonsterMod ? 1 : 0,
+                    foundByBuff ? 1 : 0,
                     tracked.Path.c_str()
                 );
                 ctx()->Log.Info(msg);
@@ -468,15 +694,27 @@ private:
 
         for (const auto& [id, tracked] : m_Tracked)
         {
-            if ((now - tracked.LastSeenSeconds) > m_ForgetAfterSeconds)
+            const float ageSinceSeen = now - tracked.LastSeenSeconds;
+            const float ageSinceLive = now - tracked.LastLiveEntitySeconds;
+
+            if (ageSinceSeen > m_ForgetAfterSeconds)
+            {
                 eraseIds.push_back(id);
+                continue;
+            }
+
+            if (tracked.WasRecentlyLive && ageSinceLive > m_MissingEntityForgetSeconds)
+            {
+                eraseIds.push_back(id);
+                continue;
+            }
         }
 
         for (uint32_t id : eraseIds)
             m_Tracked.erase(id);
     }
 
-    void DrawOverlay(const PluginSDK::Snapshot& snapshot)
+    void DrawOverlay(const PluginSDK::Snapshot& snapshot, float now)
     {
         if (m_Tracked.empty())
             return;
@@ -493,42 +731,88 @@ private:
 
         const ImVec2 screenCenter(screenW * 0.5f, screenH * 0.5f);
 
+        std::vector<uint32_t> eraseAfterDraw;
+
         for (auto& [id, tracked] : m_Tracked)
         {
             auto entityOpt = ctx()->Entities.FindById(id);
-            if (!entityOpt.has_value())
-                continue;
+            const bool hasLiveEntity = entityOpt.has_value() && entityOpt.value().IsValid;
 
-            const PluginSDK::Entity& e = entityOpt.value();
-
-            if (!e.IsValid)
-                continue;
-
-            // Live-Recheck direkt vor dem Zeichnen.
-            // Dadurch reagiert INSIDE/OUTSIDE schneller als nur über ScanEntities().
-            if (e.Components.HasBuffs())
+            if (hasLiveEntity)
             {
-                BuffScanResult liveBuffResult = ScanBuffs(e);
+                const PluginSDK::Entity& live = entityOpt.value();
 
-                tracked.InsideCloud = liveBuffResult.InsideCloud;
-                tracked.HasAnyLightlessBuff =
-                    liveBuffResult.HasAnyLightlessWellBuff || tracked.HasAnyLightlessBuff;
+                if (live.MaxHP > 0 && live.CurrentHP <= 0)
+                {
+                    eraseAfterDraw.push_back(id);
+                    continue;
+                }
+            }
 
-                if (!liveBuffResult.BuffNames.empty())
+            float worldX = tracked.WorldX;
+            float worldY = tracked.WorldY;
+            float worldZ = tracked.WorldZ;
+            float modelBoundsZ = tracked.ModelBoundsZ;
+
+            if (hasLiveEntity)
+            {
+                const PluginSDK::Entity& e = entityOpt.value();
+
+                tracked.LastLiveEntitySeconds = now;
+                tracked.WasRecentlyLive = true;
+
+                worldX = e.WorldX;
+                worldY = e.WorldY;
+                worldZ = e.WorldZ;
+                modelBoundsZ = std::max(e.ModelBoundsZ, 80.0f);
+
+                tracked.WorldX = worldX;
+                tracked.WorldY = worldY;
+                tracked.WorldZ = worldZ;
+                tracked.ModelBoundsZ = modelBoundsZ;
+
+                std::vector<std::string> liveMonsterModDebug;
+                const bool liveHasMonsterMod = HasAmanamuMonsterMod(e, &liveMonsterModDebug);
+
+                if (liveHasMonsterMod)
+                    tracked.HasAmanamuMonsterMod = true;
+
+                if (!liveMonsterModDebug.empty())
+                    tracked.LastMonsterMods = std::move(liveMonsterModDebug);
+
+                if (e.Components.HasBuffs())
+                {
+                    BuffScanResult liveBuffResult = ScanBuffs(e);
+
+                    tracked.InsideCloud = liveBuffResult.InsideCloud;
+                    tracked.HasAnyLightlessBuff =
+                        liveBuffResult.HasAnyLightlessWellBuff || tracked.HasAnyLightlessBuff;
+
                     tracked.LastBuffs = std::move(liveBuffResult.BuffNames);
+                }
             }
 
             float sx = 0.0f;
             float sy = 0.0f;
 
-            const float markerZ = e.WorldZ + std::max(e.ModelBoundsZ, 80.0f);
+            const float markerZ = worldZ + std::max(modelBoundsZ, 80.0f);
 
-            const bool onScreen = ctx()->Render.WorldToScreen(
-                e.WorldX,
-                e.WorldY,
+            const bool projectionReturned = ctx()->Render.WorldToScreen(
+                worldX,
+                worldY,
                 markerZ,
                 sx,
                 sy
+            );
+
+            UpdateCachedScreenDirection(
+                tracked,
+                projectionReturned,
+                sx,
+                sy,
+                screenW,
+                screenH,
+                screenCenter
             );
 
             const ImU32 insideColor = IM_COL32(180, 80, 255, 255);
@@ -537,7 +821,7 @@ private:
             const ImU32 color = tracked.InsideCloud ? insideColor : outsideColor;
 
             const bool visibleOnScreen =
-                onScreen &&
+                projectionReturned &&
                 sx >= 0.0f &&
                 sx <= screenW &&
                 sy >= 0.0f &&
@@ -574,45 +858,33 @@ private:
                 }
             }
 
-            // Pfeil wird gezeichnet, wenn:
-            // - Monster off-screen ist
-            // - oder Monster on-screen ist und die Option aktiv ist
             const bool shouldDrawEdgeArrow =
                 m_DrawOffscreenArrows &&
                 (!visibleOnScreen || m_DrawEdgeArrowForOnScreenMonsters);
 
             if (shouldDrawEdgeArrow)
             {
-                ImVec2 dir(0.0f, -1.0f);
-
-                if (visibleOnScreen)
-                {
-                    // Beste Richtung bei sichtbarem Monster:
-                    // tatsächliche Screenposition relativ zur Bildschirmmitte.
-                    dir = ImVec2(sx - screenCenter.x, sy - screenCenter.y);
-                }
-                else if (std::isfinite(sx) && std::isfinite(sy) && (sx != 0.0f || sy != 0.0f))
-                {
-                    // Off-screen, aber WorldToScreen hat noch brauchbare Koordinaten geliefert.
-                    dir = ImVec2(sx - screenCenter.x, sy - screenCenter.y);
-                }
-                else
-                {
-                    // Fallback: World-Differenz Player -> Monster.
-                    // Die Achsen müssen nicht perfekt zur Kamera passen, sind aber besser als nichts.
-                    const float dx = e.WorldX - snapshot.Player.WorldX;
-                    const float dy = e.WorldY - snapshot.Player.WorldY;
-                    dir = ImVec2(dx, dy);
-                }
-
-                dir = Normalize(dir);
+                ImVec2 dir = GetArrowDirection(
+                    snapshot,
+                    tracked,
+                    visibleOnScreen,
+                    projectionReturned,
+                    sx,
+                    sy,
+                    worldX,
+                    worldY,
+                    worldZ,
+                    screenW,
+                    screenH,
+                    screenCenter
+                );
 
                 const ImVec2 arrowPos = ClampToScreenEdge(
                     screenCenter,
                     dir,
                     screenW,
                     screenH,
-                    55.0f
+                    m_ArrowEdgeMargin
                 );
 
                 DrawArrow(draw, arrowPos, dir, color);
@@ -636,11 +908,14 @@ private:
                 draw->AddText(textPos, color, text);
             }
         }
+
+        for (uint32_t eraseId : eraseAfterDraw)
+            m_Tracked.erase(eraseId);
     }
 
     void DrawDebugWindow(const PluginSDK::Snapshot& snapshot)
     {
-        ImGui::SetNextWindowSize(ImVec2(560, 360), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(820, 460), ImGuiCond_FirstUseEver);
 
         if (!ImGui::Begin("Amanamu Void Alert Debug", &m_ShowDebugWindow))
         {
@@ -650,9 +925,11 @@ private:
 
         ImGui::Text("Area: %s", snapshot.CurrentAreaName.c_str());
         ImGui::Text("Tracked monsters: %zu", m_Tracked.size());
-        ImGui::Text("Detection buff prefix: %s", kBuffPrefixAbyssLightlessWell);
+        ImGui::Text("MonsterMod Id: %s", kExpectedMonsterModId);
+        ImGui::Text("MonsterMod Metadata: %s", kExpectedMonsterModMetadata);
+        ImGui::Text("MonsterMod Hash16: 0x%04X", static_cast<unsigned int>(kExpectedMonsterModHash16));
+        ImGui::Text("MonsterMod Hash32: 0x%08X", static_cast<unsigned int>(kExpectedMonsterModHash32));
         ImGui::Text("Inside-cloud buff: %s", kBuffInsideCloud);
-        ImGui::Text("Expected mod id: %s", kExpectedMonsterModId);
 
         ImGui::Separator();
 
@@ -666,7 +943,7 @@ private:
 
         ImGui::Separator();
 
-        if (ImGui::BeginTable("##tracked_amanamu", 6,
+        if (ImGui::BeginTable("##tracked_amanamu", 9,
             ImGuiTableFlags_Borders |
             ImGuiTableFlags_RowBg |
             ImGuiTableFlags_Resizable |
@@ -674,10 +951,13 @@ private:
         {
             ImGui::TableSetupColumn("Id");
             ImGui::TableSetupColumn("State");
+            ImGui::TableSetupColumn("ByMod");
+            ImGui::TableSetupColumn("Dir");
             ImGui::TableSetupColumn("Dist");
             ImGui::TableSetupColumn("Seen");
+            ImGui::TableSetupColumn("Live");
             ImGui::TableSetupColumn("Path");
-            ImGui::TableSetupColumn("Buffs");
+            ImGui::TableSetupColumn("Mods/Buffs");
             ImGui::TableHeadersRow();
 
             const float now = SecondsSinceEnable();
@@ -696,22 +976,51 @@ private:
                     ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.45f, 1.0f), "OUTSIDE");
 
                 ImGui::TableSetColumnIndex(2);
-                ImGui::Text("%.0f", tracked.Distance);
+                if (tracked.HasAmanamuMonsterMod)
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.45f, 1.0f), "YES");
+                else
+                    ImGui::TextDisabled("NO");
 
                 ImGui::TableSetColumnIndex(3);
-                ImGui::Text("%.1fs", now - tracked.LastSeenSeconds);
+                if (tracked.HasLastScreenDirection)
+                    ImGui::Text("%.2f, %.2f", tracked.LastScreenDirection.x, tracked.LastScreenDirection.y);
+                else
+                    ImGui::TextDisabled("none");
 
                 ImGui::TableSetColumnIndex(4);
-                ImGui::TextWrapped("%s", tracked.Path.c_str());
+                ImGui::Text("%.0f", tracked.Distance);
 
                 ImGui::TableSetColumnIndex(5);
+                ImGui::Text("%.1fs", now - tracked.LastSeenSeconds);
 
-                if (tracked.LastBuffs.empty())
+                ImGui::TableSetColumnIndex(6);
+                ImGui::Text("%.1fs", now - tracked.LastLiveEntitySeconds);
+
+                ImGui::TableSetColumnIndex(7);
+                ImGui::TextWrapped("%s", tracked.Path.c_str());
+
+                ImGui::TableSetColumnIndex(8);
+
+                if (!tracked.LastMonsterMods.empty())
                 {
-                    ImGui::TextDisabled("-");
+                    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "MonsterMods:");
+                    for (const std::string& modLine : tracked.LastMonsterMods)
+                    {
+                        if (ContainsInsensitive(modLine, "Abyss") ||
+                            ContainsInsensitive(modLine, "Lightless") ||
+                            ContainsInsensitive(modLine, "Amanamu") ||
+                            ContainsInsensitive(modLine, "MonsterAbyss") ||
+                            ContainsInsensitive(modLine, "0xBFDA2A36") ||
+                            ContainsInsensitive(modLine, "0x63D1"))
+                        {
+                            ImGui::TextWrapped("%s", modLine.c_str());
+                        }
+                    }
                 }
-                else
+
+                if (!tracked.LastBuffs.empty())
                 {
+                    ImGui::TextColored(ImVec4(0.9f, 0.8f, 1.0f, 1.0f), "Buffs:");
                     for (const std::string& buff : tracked.LastBuffs)
                     {
                         if (ContainsInsensitive(buff, "abyss") ||
@@ -722,6 +1031,9 @@ private:
                         }
                     }
                 }
+
+                if (tracked.LastMonsterMods.empty() && tracked.LastBuffs.empty())
+                    ImGui::TextDisabled("-");
             }
 
             ImGui::EndTable();
@@ -741,9 +1053,12 @@ private:
     bool m_LogNewDetections = true;
 
     float m_MaxDistance = 3500.0f;
-    float m_ForgetAfterSeconds = 8.0f;
+    float m_ForgetAfterSeconds = 15.0f;
+    float m_MissingEntityForgetSeconds = 1.25f;
     float m_LabelYOffset = 70.0f;
     float m_CircleRadius = 34.0f;
+    float m_ArrowEdgeMargin = 95.0f;
+    float m_ProxyDistance = 900.0f;
 
     std::chrono::steady_clock::time_point m_EnableTime{};
     std::unordered_map<uint32_t, TrackedMonster> m_Tracked;
