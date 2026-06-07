@@ -668,6 +668,29 @@ struct ItemMods {
     bool Valid = false;
 };
 
+// One monster modifier from an ObjectMagicProperties component
+// (ComponentsService::EnumerateMonsterMods). Match on Id (most stable),
+// Metadata, or a hash. Metadata is empty for non-monster mods.
+struct MonsterMod {
+    std::string Id;        // Mods.dat Id, e.g. "MonsterAbyssLightlessFaction1"
+    std::string Name;      // Mods.dat Name (display), e.g. "Abyssal"
+    std::string Metadata;  // Mods.dat MonsterMetadata, e.g. "Metadata/.../LightlessWells"
+    uint16_t    Hash16 = 0;          // e.g. 0x63D1
+    uint32_t    Hash32 = 0;          // e.g. 0xBFDA2A36
+    int         GenerationType = 0;  // 1=Prefix 2=Suffix 3=Implicit
+
+    static MonsterMod FromAbi(const MonsterModAbi& a, const HostAbi* abi) {
+        MonsterMod m;
+        m.Id             = FetchString(a.id_addr, abi);
+        m.Name           = FetchString(a.display_name_addr, abi);
+        m.Metadata       = FetchString(a.metadata_addr, abi);
+        m.Hash16         = a.hash16;
+        m.Hash32         = a.hash32;
+        m.GenerationType = a.generation_type;
+        return m;
+    }
+};
+
 struct UiElement {
     uintptr_t ParentAddress = 0;
     int       ChildCount = 0;
@@ -1493,6 +1516,26 @@ public:
             [](const ModAbi* m, PsdkModKind kind, void* ud) -> int32_t {
                 auto* p = static_cast<Ctx*>(ud);
                 p->out->push_back(Mod::FromAbi(*m, static_cast<ModKind>(kind), p->host));
+                return 1;
+            },
+            &c);
+        return out;
+    }
+
+    // Enumerate a monster's rolled mods from its ObjectMagicProperties
+    // component address (Entity::Components.OMP). Lets a plugin identify a
+    // monster's modifiers the instant it spawns — before any related buff is
+    // applied. Empty if the unit has no OMP component / no mods. Match on
+    // MonsterMod::Id (most stable), Metadata, or Hash16/Hash32.
+    std::vector<MonsterMod> EnumerateMonsterMods(uintptr_t ompAddr) const {
+        std::vector<MonsterMod> out;
+        if (!m_host || !m_host->enumerate_monster_mods || ompAddr == 0) return out;
+        struct Ctx { std::vector<MonsterMod>* out; const HostAbi* host; };
+        Ctx c{ &out, m_host };
+        m_host->enumerate_monster_mods(ompAddr,
+            [](const MonsterModAbi* m, void* ud) -> int32_t {
+                auto* p = static_cast<Ctx*>(ud);
+                p->out->push_back(MonsterMod::FromAbi(*m, p->host));
                 return 1;
             },
             &c);

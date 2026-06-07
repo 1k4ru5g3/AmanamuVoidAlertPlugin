@@ -327,6 +327,23 @@ typedef struct {
     int32_t dest_y;
 } ActorActionAbi;
 
+// One monster modifier, read from an ObjectMagicProperties component
+// (HostAbi::enumerate_monster_mods). Lets a plugin identify a monster's rolled
+// mods the instant it spawns — before any related buff is applied. The three
+// *_addr fields are host-owned strings (read via MemoryService / FetchString,
+// valid only for the duration of the visitor call); metadata_addr is empty for
+// non-monster mods. id/hashes map to the Mods.dat Id/HASH16/HASH32 columns.
+typedef struct {
+    uintptr_t id_addr;            // Mods.dat Id, e.g. "MonsterAbyssLightlessFaction1"
+    uintptr_t display_name_addr;  // Mods.dat Name (display), e.g. "Abyssal"
+    uintptr_t metadata_addr;      // Mods.dat MonsterMetadata, e.g. "Metadata/.../LightlessWells"
+    uint32_t  hash32;             // Mods.dat HASH32, e.g. 0xBFDA2A36
+    uint16_t  hash16;             // Mods.dat HASH16, e.g. 0x63D1
+    int16_t   generation_type;    // 1=Prefix 2=Suffix 3=Implicit
+} MonsterModAbi;
+
+typedef int32_t (*PsdkMonsterModVisitorFn)(const MonsterModAbi* mod, void* userdata);
+
 typedef struct {
     int32_t valid;
     int32_t _pad;
@@ -840,6 +857,12 @@ typedef struct HostAbi {
 
     // Current action (flags + target cell) from an Actor component address.
     int32_t (*read_actor_action)(uintptr_t actor_addr, ActorActionAbi* out);
+
+    // Enumerate a monster's rolled mods from its ObjectMagicProperties
+    // component address (ComponentAddressesAbi::omp). Detects monster modifiers
+    // at spawn, before any related buff. Append-only tail (2026-06-07).
+    void (*enumerate_monster_mods)(uintptr_t omp_addr,
+                                   PsdkMonsterModVisitorFn cb, void* ud);
 } HostAbi;
 
 #ifdef __cplusplus

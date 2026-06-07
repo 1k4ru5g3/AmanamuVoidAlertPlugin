@@ -3,19 +3,20 @@
 // POE2Fixer / POEFixer SDK v6 Plugin
 //
 // Funktion:
-// - Erkennt Monster, die den Buff "abyss_lightless_well..." haben.
-// - Merkt sich diese Monster per EntityId.
-// - Zeigt an:
-//      INSIDE CLOUD  = Monster hat aktuell den Lightless-Well-Buff
-//      OUTSIDE CLOUD = Monster wurde als Lightless/Amanamu erkannt,
-//                      hat den Buff aber aktuell nicht mehr
-// - Zeichnet On-Screen Marker und Off-Screen/Edge Pfeile.
-// - Debug-Fenster mit erkannten Entities/Buffs.
+// - Erkennt Amanamu/Lightless-Well-Monster sofort über MonsterMods / OMP:
+//      MonsterAbyssLightlessFaction1
+//      Metadata/Monsters/MonsterMods/LeagueAbyss/LightlessWells
+//      HASH16 0x63D1
+//      HASH32 0xBFDA2A36
 //
-// Änderungen:
-// - Pfeil kann jetzt auch angezeigt werden, wenn das Monster auf dem Bildschirm ist.
-// - Buff-Status wird direkt vor dem Zeichnen nochmal neu gescannt,
-//   damit INSIDE/OUTSIDE schneller aktualisiert.
+// - Erkennt zusätzlich den Cloud-Status über Buffs:
+//      INSIDE CLOUD  = Monster hat aktuell "abyss_lightless_well_immune..."
+//      OUTSIDE CLOUD = Monster hat den MonsterMod, aber nicht den Inside-Buff
+//
+// - Buff+Cache bleibt als Fallback erhalten.
+// - Zeichnet On-Screen Marker und Edge-Pfeile.
+// - Pfeil kann auch angezeigt werden, wenn Monster bereits sichtbar ist.
+// - Debug-Fenster mit MonsterMods und Buffs.
 // ============================================================================
 
 #define NOMINMAX
@@ -23,7 +24,6 @@
 #include "sdk/PluginSDK.h"
 
 // Je nach Projekt-Setup kann einer dieser Includes passen.
-// Im ExamplePlugin ist ImGui bereits Teil des Projekts.
 // Falls "imgui/imgui.h" nicht gefunden wird, nimm stattdessen: #include "imgui.h"
 #include "imgui/imgui.h"
 
@@ -47,12 +47,12 @@ namespace
     constexpr const char* kBuffPrefixAbyssLightlessWell = "abyss_lightless_well";
     constexpr const char* kBuffInsideCloud = "abyss_lightless_well_immune";
 
-    // Deine gefundene Mod-ID aus mods.csv Row 14451.
-    // Aktuell nur Doku/Debug, weil SDK v6 in den sichtbaren Headern keinen
-    // Monster-OMP-Mod-Enumerator anbietet.
     constexpr const char* kExpectedMonsterModId = "MonsterAbyssLightlessFaction1";
     constexpr const char* kExpectedMonsterModMetadata =
         "Metadata/Monsters/MonsterMods/LeagueAbyss/LightlessWells";
+
+    constexpr uint16_t kExpectedMonsterModHash16 = 0x63D1;
+    constexpr uint32_t kExpectedMonsterModHash32 = 0xBFDA2A36;
 
     static std::string ToLower(std::string s)
     {
@@ -98,8 +98,6 @@ namespace
 
     static ImVec2 ClampToScreenEdge(ImVec2 center, ImVec2 dir, float width, float height, float margin)
     {
-        // Ray vom Bildschirmzentrum in Richtung dir bis Bildschirmrand.
-        // Danach etwas nach innen mit margin.
         dir = Normalize(dir);
 
         float tx = 999999.0f;
@@ -146,12 +144,17 @@ namespace
         uint32_t Id = 0;
         uintptr_t Address = 0;
         std::string Path;
+
         bool SeenThisFrame = false;
         bool InsideCloud = false;
         bool HasAnyLightlessBuff = false;
+        bool HasAmanamuMonsterMod = false;
+
         float Distance = 0.0f;
         float LastSeenSeconds = 0.0f;
+
         std::vector<std::string> LastBuffs;
+        std::vector<std::string> LastMonsterMods;
     };
 }
 
@@ -196,7 +199,7 @@ public:
         ImGui::Checkbox("Enable overlay", &m_EnableOverlay);
         ImGui::Checkbox("Show debug window", &m_ShowDebugWindow);
         ImGui::Checkbox("Draw on-screen labels", &m_DrawOnScreenLabels);
-        ImGui::Checkbox("Draw off-screen arrows", &m_DrawOffscreenArrows);
+        ImGui::Checkbox("Draw off-screen / edge arrows", &m_DrawOffscreenArrows);
         ImGui::Checkbox("Draw edge arrow even when monster is on screen", &m_DrawEdgeArrowForOnScreenMonsters);
         ImGui::Checkbox("Draw circle around monster", &m_DrawCircle);
         ImGui::Checkbox("Only rare/unique monsters", &m_OnlyRareOrUnique);
@@ -211,11 +214,17 @@ public:
 
         ImGui::Separator();
 
-        ImGui::TextWrapped("Current detection:");
+        ImGui::TextWrapped("Primary detection:");
+        ImGui::BulletText("MonsterMod Id: %s", kExpectedMonsterModId);
+        ImGui::BulletText("MonsterMod Metadata: %s", kExpectedMonsterModMetadata);
+        ImGui::BulletText("MonsterMod Hash16: 0x%04X", static_cast<unsigned int>(kExpectedMonsterModHash16));
+        ImGui::BulletText("MonsterMod Hash32: 0x%08X", static_cast<unsigned int>(kExpectedMonsterModHash32));
+
+        ImGui::Separator();
+
+        ImGui::TextWrapped("Cloud status detection:");
         ImGui::BulletText("Inside cloud: monster buff contains '%s'", kBuffInsideCloud);
-        ImGui::BulletText("Known Amanamu monster: entity had any buff containing '%s'", kBuffPrefixAbyssLightlessWell);
-        ImGui::BulletText("Expected final mod id, if OMP becomes readable: %s", kExpectedMonsterModId);
-        ImGui::BulletText("Expected mod metadata: %s", kExpectedMonsterModMetadata);
+        ImGui::BulletText("Fallback known monster: entity had any buff containing '%s'", kBuffPrefixAbyssLightlessWell);
 
         if (ImGui::Button("Clear tracked monsters"))
             m_Tracked.clear();
@@ -352,7 +361,10 @@ private:
         if (m_OnlyRareOrUnique && e.Rarity < 2)
             return false;
 
-        if (!e.Components.HasBuffs())
+        // Wichtig:
+        // Früher war hier nur HasBuffs().
+        // Für Soforterkennung brauchen wir auch Entities mit OMP, bevor ein Buff existiert.
+        if (!e.Components.HasBuffs() && !e.Components.HasOMP())
             return false;
 
         return true;
@@ -390,21 +402,66 @@ private:
         return result;
     }
 
+    bool HasAmanamuMonsterMod(const PluginSDK::Entity& e, std::vector<std::string>* debugMods = nullptr) const
+    {
+        if (!e.Components.HasOMP())
+            return false;
+
+        std::vector<PluginSDK::MonsterMod> mods =
+            ctx()->Components.EnumerateMonsterMods(e.Components.OMP);
+
+        bool found = false;
+
+        for (const PluginSDK::MonsterMod& mod : mods)
+        {
+            if (debugMods)
+            {
+                char line[768];
+                std::snprintf(
+                    line,
+                    sizeof(line),
+                    "%s | %s | %s | h16=0x%04X h32=0x%08X gen=%d",
+                    mod.Id.c_str(),
+                    mod.Name.c_str(),
+                    mod.Metadata.c_str(),
+                    static_cast<unsigned int>(mod.Hash16),
+                    static_cast<unsigned int>(mod.Hash32),
+                    static_cast<int>(mod.GenerationType)
+                );
+
+                debugMods->push_back(line);
+            }
+
+            if (mod.Id == kExpectedMonsterModId)
+                found = true;
+
+            if (mod.Metadata == kExpectedMonsterModMetadata)
+                found = true;
+
+            if (mod.Hash16 == kExpectedMonsterModHash16)
+                found = true;
+
+            if (mod.Hash32 == kExpectedMonsterModHash32)
+                found = true;
+        }
+
+        return found;
+    }
+
     bool HasInterestingStatsFallback(const PluginSDK::Entity& e) const
     {
         // Optionaler Fallback/Debug:
         // Row 4754 MonsterProximalTangibility1 hatte Stat1 = 19783.
-        // Das ist NICHT der von dir bevorzugte LightlessWells-Mod Row 14451,
-        // aber falls ein Monster diesen Stat in Components.Stats hat,
-        // kann man ihn testweise ebenfalls markieren.
+        // Das ist NICHT der bevorzugte LightlessWells-Mod Row 14451.
+        // Default bewusst false lassen, um false positives zu vermeiden.
         //
-        // Default hier bewusst false lassen, weil false positives möglich sind.
-        // Zum Testen kannst du das aktivieren:
+        // Zum Testen könntest du aktivieren:
         //
-        // for (auto s : ctx()->Components.EnumerateStats(e.Components.Stats))
-        //     if (s.Key == 19783) return true;
-        //
-        // return false;
+        // if (e.Components.HasStats())
+        // {
+        //     for (auto s : ctx()->Components.EnumerateStats(e.Components.Stats))
+        //         if (s.Key == 19783) return true;
+        // }
 
         (void)e;
         return false;
@@ -425,13 +482,16 @@ private:
 
             BuffScanResult buffResult = ScanBuffs(e);
 
+            std::vector<std::string> monsterModDebug;
+            const bool foundByMonsterMod = HasAmanamuMonsterMod(e, &monsterModDebug);
+
             const bool foundByBuff = buffResult.HasAnyLightlessWellBuff;
             const bool foundByStatsFallback = HasInterestingStatsFallback(e);
 
             auto existingIt = m_Tracked.find(e.Id);
             const bool alreadyKnown = existingIt != m_Tracked.end();
 
-            if (!foundByBuff && !foundByStatsFallback && !alreadyKnown)
+            if (!foundByMonsterMod && !foundByBuff && !foundByStatsFallback && !alreadyKnown)
                 continue;
 
             const bool isNew = !alreadyKnown;
@@ -443,18 +503,30 @@ private:
             tracked.SeenThisFrame = true;
             tracked.Distance = distance;
             tracked.LastSeenSeconds = now;
+
+            tracked.HasAmanamuMonsterMod = foundByMonsterMod || tracked.HasAmanamuMonsterMod;
             tracked.HasAnyLightlessBuff = buffResult.HasAnyLightlessWellBuff || tracked.HasAnyLightlessBuff;
+
+            // Status:
+            // MonsterMod sagt: Das ist ein relevantes Monster.
+            // Buff sagt: Es steht gerade in der Cloud.
             tracked.InsideCloud = buffResult.InsideCloud;
+
             tracked.LastBuffs = std::move(buffResult.BuffNames);
+
+            if (!monsterModDebug.empty())
+                tracked.LastMonsterMods = std::move(monsterModDebug);
 
             if (isNew && m_LogNewDetections)
             {
-                char msg[512];
+                char msg[768];
                 std::snprintf(
                     msg,
                     sizeof(msg),
-                    "Detected possible Amanamu/Lightless monster: id=%u path=%s",
+                    "Detected Amanamu/Lightless monster: id=%u byMod=%d byBuff=%d path=%s",
                     tracked.Id,
+                    foundByMonsterMod ? 1 : 0,
+                    foundByBuff ? 1 : 0,
                     tracked.Path.c_str()
                 );
                 ctx()->Log.Info(msg);
@@ -504,8 +576,18 @@ private:
             if (!e.IsValid)
                 continue;
 
-            // Live-Recheck direkt vor dem Zeichnen.
-            // Dadurch reagiert INSIDE/OUTSIDE schneller als nur über ScanEntities().
+            // Live-Recheck direkt vor dem Zeichnen:
+            // - MonsterMod erneut prüfen, falls Snapshot/OMP später verfügbar wird.
+            // - Buff erneut prüfen, damit INSIDE/OUTSIDE schneller reagiert.
+            std::vector<std::string> liveMonsterModDebug;
+            const bool liveHasMonsterMod = HasAmanamuMonsterMod(e, &liveMonsterModDebug);
+
+            if (liveHasMonsterMod)
+                tracked.HasAmanamuMonsterMod = true;
+
+            if (!liveMonsterModDebug.empty())
+                tracked.LastMonsterMods = std::move(liveMonsterModDebug);
+
             if (e.Components.HasBuffs())
             {
                 BuffScanResult liveBuffResult = ScanBuffs(e);
@@ -514,8 +596,7 @@ private:
                 tracked.HasAnyLightlessBuff =
                     liveBuffResult.HasAnyLightlessWellBuff || tracked.HasAnyLightlessBuff;
 
-                if (!liveBuffResult.BuffNames.empty())
-                    tracked.LastBuffs = std::move(liveBuffResult.BuffNames);
+                tracked.LastBuffs = std::move(liveBuffResult.BuffNames);
             }
 
             float sx = 0.0f;
@@ -587,19 +668,17 @@ private:
 
                 if (visibleOnScreen)
                 {
-                    // Beste Richtung bei sichtbarem Monster:
-                    // tatsächliche Screenposition relativ zur Bildschirmmitte.
+                    // Bei sichtbarem Monster ist die Screenposition die beste Richtung.
                     dir = ImVec2(sx - screenCenter.x, sy - screenCenter.y);
                 }
                 else if (std::isfinite(sx) && std::isfinite(sy) && (sx != 0.0f || sy != 0.0f))
                 {
-                    // Off-screen, aber WorldToScreen hat noch brauchbare Koordinaten geliefert.
+                    // Off-screen, aber WorldToScreen liefert brauchbare projizierte Koordinaten.
                     dir = ImVec2(sx - screenCenter.x, sy - screenCenter.y);
                 }
                 else
                 {
                     // Fallback: World-Differenz Player -> Monster.
-                    // Die Achsen müssen nicht perfekt zur Kamera passen, sind aber besser als nichts.
                     const float dx = e.WorldX - snapshot.Player.WorldX;
                     const float dy = e.WorldY - snapshot.Player.WorldY;
                     dir = ImVec2(dx, dy);
@@ -640,7 +719,7 @@ private:
 
     void DrawDebugWindow(const PluginSDK::Snapshot& snapshot)
     {
-        ImGui::SetNextWindowSize(ImVec2(560, 360), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(760, 440), ImGuiCond_FirstUseEver);
 
         if (!ImGui::Begin("Amanamu Void Alert Debug", &m_ShowDebugWindow))
         {
@@ -650,9 +729,11 @@ private:
 
         ImGui::Text("Area: %s", snapshot.CurrentAreaName.c_str());
         ImGui::Text("Tracked monsters: %zu", m_Tracked.size());
-        ImGui::Text("Detection buff prefix: %s", kBuffPrefixAbyssLightlessWell);
+        ImGui::Text("MonsterMod Id: %s", kExpectedMonsterModId);
+        ImGui::Text("MonsterMod Metadata: %s", kExpectedMonsterModMetadata);
+        ImGui::Text("MonsterMod Hash16: 0x%04X", static_cast<unsigned int>(kExpectedMonsterModHash16));
+        ImGui::Text("MonsterMod Hash32: 0x%08X", static_cast<unsigned int>(kExpectedMonsterModHash32));
         ImGui::Text("Inside-cloud buff: %s", kBuffInsideCloud);
-        ImGui::Text("Expected mod id: %s", kExpectedMonsterModId);
 
         ImGui::Separator();
 
@@ -666,7 +747,7 @@ private:
 
         ImGui::Separator();
 
-        if (ImGui::BeginTable("##tracked_amanamu", 6,
+        if (ImGui::BeginTable("##tracked_amanamu", 7,
             ImGuiTableFlags_Borders |
             ImGuiTableFlags_RowBg |
             ImGuiTableFlags_Resizable |
@@ -674,10 +755,11 @@ private:
         {
             ImGui::TableSetupColumn("Id");
             ImGui::TableSetupColumn("State");
+            ImGui::TableSetupColumn("ByMod");
             ImGui::TableSetupColumn("Dist");
             ImGui::TableSetupColumn("Seen");
             ImGui::TableSetupColumn("Path");
-            ImGui::TableSetupColumn("Buffs");
+            ImGui::TableSetupColumn("Mods/Buffs");
             ImGui::TableHeadersRow();
 
             const float now = SecondsSinceEnable();
@@ -696,22 +778,42 @@ private:
                     ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.45f, 1.0f), "OUTSIDE");
 
                 ImGui::TableSetColumnIndex(2);
-                ImGui::Text("%.0f", tracked.Distance);
+                if (tracked.HasAmanamuMonsterMod)
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.45f, 1.0f), "YES");
+                else
+                    ImGui::TextDisabled("NO");
 
                 ImGui::TableSetColumnIndex(3);
-                ImGui::Text("%.1fs", now - tracked.LastSeenSeconds);
+                ImGui::Text("%.0f", tracked.Distance);
 
                 ImGui::TableSetColumnIndex(4);
-                ImGui::TextWrapped("%s", tracked.Path.c_str());
+                ImGui::Text("%.1fs", now - tracked.LastSeenSeconds);
 
                 ImGui::TableSetColumnIndex(5);
+                ImGui::TextWrapped("%s", tracked.Path.c_str());
 
-                if (tracked.LastBuffs.empty())
+                ImGui::TableSetColumnIndex(6);
+
+                if (!tracked.LastMonsterMods.empty())
                 {
-                    ImGui::TextDisabled("-");
+                    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "MonsterMods:");
+                    for (const std::string& modLine : tracked.LastMonsterMods)
+                    {
+                        if (ContainsInsensitive(modLine, "Abyss") ||
+                            ContainsInsensitive(modLine, "Lightless") ||
+                            ContainsInsensitive(modLine, "Amanamu") ||
+                            ContainsInsensitive(modLine, "MonsterAbyss") ||
+                            ContainsInsensitive(modLine, "0xBFDA2A36") ||
+                            ContainsInsensitive(modLine, "0x63D1"))
+                        {
+                            ImGui::TextWrapped("%s", modLine.c_str());
+                        }
+                    }
                 }
-                else
+
+                if (!tracked.LastBuffs.empty())
                 {
+                    ImGui::TextColored(ImVec4(0.9f, 0.8f, 1.0f, 1.0f), "Buffs:");
                     for (const std::string& buff : tracked.LastBuffs)
                     {
                         if (ContainsInsensitive(buff, "abyss") ||
@@ -722,6 +824,9 @@ private:
                         }
                     }
                 }
+
+                if (tracked.LastMonsterMods.empty() && tracked.LastBuffs.empty())
+                    ImGui::TextDisabled("-");
             }
 
             ImGui::EndTable();
