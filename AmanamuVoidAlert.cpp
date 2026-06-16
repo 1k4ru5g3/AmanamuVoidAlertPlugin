@@ -214,9 +214,6 @@ public:
 
     void DrawSettings() override
     {
-        if (ctx()->ImGuiContext)
-            ImGui::SetCurrentContext(static_cast<ImGuiContext*>(ctx()->ImGuiContext));
-
         ImGui::Checkbox("Enable overlay", &m_EnableOverlay);
         ImGui::Checkbox("Show debug window", &m_ShowDebugWindow);
         ImGui::Checkbox("Draw on-screen labels", &m_DrawOnScreenLabels);
