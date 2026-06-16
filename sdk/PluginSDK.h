@@ -1468,6 +1468,28 @@ public:
         return out;
     }
 
+    // Like EnumerateBuffs, but duplicate-named status effects are aggregated
+    // into ONE Buff whose Charges is the summed stack count, matching the
+    // in-game charge-stack icon. Example: Chayula breach charges are stored as
+    // N separate StatusEffect instances of Charges=1 — EnumerateBuffs returns N
+    // rows of "1", while this returns one row of "N". Single-instance buffs
+    // (power/frenzy charges) are identical to EnumerateBuffs. Returns empty if
+    // the host predates this API (it lives on the HostAbi tail; null-checked).
+    std::vector<Buff> EnumerateAggregatedBuffs(uintptr_t buffsAddr) const {
+        std::vector<Buff> out;
+        if (!m_host || !m_host->enumerate_buffs_aggregated) return out;
+        struct Ctx { std::vector<Buff>* out; const HostAbi* host; };
+        Ctx c{ &out, m_host };
+        m_host->enumerate_buffs_aggregated(buffsAddr,
+            [](const BuffAbi* b, void* ud) -> int32_t {
+                auto* p = static_cast<Ctx*>(ud);
+                p->out->push_back(Buff::FromAbi(*b, p->host));
+                return 1;
+            },
+            &c);
+        return out;
+    }
+
     std::vector<ActiveSkill> EnumerateActiveSkills(uintptr_t actorAddr) const {
         std::vector<ActiveSkill> out;
         if (!m_abi || !m_abi->enumerate_active_skills) return out;
