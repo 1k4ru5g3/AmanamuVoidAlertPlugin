@@ -734,6 +734,9 @@ typedef struct {
                                                PsdkModVisitorFn cb, void* ud);
 } InventoryServiceAbi;
 
+// One UI element's screen rect; ok==0 means the element could not be projected.
+typedef struct { float x, y, w, h; int32_t ok; } PsdkScreenRectAbi;
+
 // Walk the game's UI tree. follow_path indexes child-by-child from a root;
 // the string getters use the query-then-fill convention (buf=NULL for size).
 typedef struct {
@@ -863,6 +866,26 @@ typedef struct HostAbi {
     // at spawn, before any related buff. Append-only tail (2026-06-07).
     void (*enumerate_monster_mods)(uintptr_t omp_addr,
                                    PsdkMonsterModVisitorFn cb, void* ud);
+
+    // Batch-project N UI elements to screen rects in one ABI hop (shared-
+    // ancestor memo). MUST live on the HostAbi tail, NOT inside UiServiceAbi:
+    // services are embedded by value, so growing a mid-struct service shifts
+    // every field after it and breaks already-compiled plugins. Append-only
+    // tail (moved off UiServiceAbi 2026-06-16 to restore that ABI compat).
+    int32_t (*compute_screen_rects)(const uintptr_t* addrs, int32_t count,
+                                    PsdkScreenRectAbi* out);
+
+    // Enumerate buffs AGGREGATED by name: duplicate-named status effects
+    // (e.g. each Chayula breach charge is its own StatusEffect instance)
+    // collapse into ONE entry whose `charges` = the first instance's raw
+    // charges + 1 per additional instance — matching the in-game charge-stack
+    // icon and the host Debug "Chg" column (mirrors GameData::Buffs::
+    // StatusEffects()). The plain ComponentsService enumerate_buffs returns the
+    // raw per-instance list, so single-instance buffs (power/frenzy charges that
+    // already carry their count) read identically either way; only multi-
+    // instance stacks differ. Append-only tail (2026-06-16).
+    void (*enumerate_buffs_aggregated)(uintptr_t buffs_addr,
+                                       PsdkBuffVisitorFn cb, void* ud);
 } HostAbi;
 
 #ifdef __cplusplus

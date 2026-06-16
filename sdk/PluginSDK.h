@@ -1468,6 +1468,28 @@ public:
         return out;
     }
 
+    // Like EnumerateBuffs, but duplicate-named status effects are aggregated
+    // into ONE Buff whose Charges is the summed stack count, matching the
+    // in-game charge-stack icon. Example: Chayula breach charges are stored as
+    // N separate StatusEffect instances of Charges=1 — EnumerateBuffs returns N
+    // rows of "1", while this returns one row of "N". Single-instance buffs
+    // (power/frenzy charges) are identical to EnumerateBuffs. Returns empty if
+    // the host predates this API (it lives on the HostAbi tail; null-checked).
+    std::vector<Buff> EnumerateAggregatedBuffs(uintptr_t buffsAddr) const {
+        std::vector<Buff> out;
+        if (!m_host || !m_host->enumerate_buffs_aggregated) return out;
+        struct Ctx { std::vector<Buff>* out; const HostAbi* host; };
+        Ctx c{ &out, m_host };
+        m_host->enumerate_buffs_aggregated(buffsAddr,
+            [](const BuffAbi* b, void* ud) -> int32_t {
+                auto* p = static_cast<Ctx*>(ud);
+                p->out->push_back(Buff::FromAbi(*b, p->host));
+                return 1;
+            },
+            &c);
+        return out;
+    }
+
     std::vector<ActiveSkill> EnumerateActiveSkills(uintptr_t actorAddr) const {
         std::vector<ActiveSkill> out;
         if (!m_abi || !m_abi->enumerate_active_skills) return out;
@@ -1810,6 +1832,22 @@ public:
     bool ComputeScreenRect(uintptr_t addr, float& x, float& y, float& w, float& h) const {
         if (!m_abi || !m_abi->compute_screen_rect) return false;
         return m_abi->compute_screen_rect(addr, &x, &y, &w, &h) != 0;
+    }
+
+    struct ScreenRect { float x = 0, y = 0, w = 0, h = 0; bool ok = false; };
+
+    // Batch variant of ComputeScreenRect. Returns one ScreenRect per input addr
+    // (same order). Empty / all-not-ok if the host is too old to provide it.
+    std::vector<ScreenRect> ComputeScreenRects(const std::vector<uintptr_t>& addrs) const {
+        std::vector<ScreenRect> out(addrs.size());
+        // compute_screen_rects lives on the HostAbi tail (see PluginAbi.h), so it
+        // is reached through m_host, not m_abi. Old hosts leave it null -> all not-ok.
+        if (!m_host || !m_host->compute_screen_rects || addrs.empty()) return out;
+        std::vector<PsdkScreenRectAbi> tmp(addrs.size());
+        m_host->compute_screen_rects(addrs.data(), static_cast<int32_t>(addrs.size()), tmp.data());
+        for (size_t i = 0; i < addrs.size(); ++i)
+            out[i] = { tmp[i].x, tmp[i].y, tmp[i].w, tmp[i].h, tmp[i].ok != 0 };
+        return out;
     }
 
     uintptr_t GetGameUiRoot() const {
