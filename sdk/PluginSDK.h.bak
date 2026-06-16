@@ -15,8 +15,6 @@
 // set ImGui's context from ctx()->ImGuiContext each frame.
 #pragma once
 
-
-#include <cstddef>
 #include "PluginAbi.h"
 
 #include <cstdint>
@@ -2355,14 +2353,10 @@ inline void PluginSDK_AttachHost(PluginSDK::Plugin* p,
                                  const char*        directory) {
     if (!p) return;
     p->m_directory = directory ? directory : "";
-    const size_t requiredHostSize =
-        offsetof(HostAbi, enumerate_monster_mods) +
-        sizeof(((HostAbi*)nullptr)->enumerate_monster_mods);
-
     p->m_host_compatible =
-        (abi != nullptr &&
-         abi->version == PLUGIN_SDK_VERSION &&
-         abi->size_bytes >= requiredHostSize);
+        (abi != nullptr
+         && abi->version == PLUGIN_SDK_VERSION
+         && abi->size_bytes >= sizeof(HostAbi));
     if (!p->m_host_compatible) return;
 
     p->m_ctx.Game      .Init(&abi->game,       abi);

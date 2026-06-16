@@ -1,32 +1,14 @@
 // ============================================================================
-// AmanamuVoidPlugin.cpp
+// AmanamuVoidAlert.cpp
 // POE2Fixer / POEFixer SDK v6 Plugin
 //
-// Funktion:
-// - Erkennt Amanamu/Lightless-Well-Monster sofort über MonsterMods / OMP:
-//      MonsterAbyssLightlessFaction1
-//      Metadata/Monsters/MonsterMods/LeagueAbyss/LightlessWells
-//      HASH16 0x63D1
-//      HASH32 0xBFDA2A36
-//
-// - Erkennt zusätzlich den Cloud-Status über Buffs:
-//      INSIDE CLOUD  = Monster hat aktuell "abyss_lightless_well_immune..."
-//      OUTSIDE CLOUD = Monster hat den MonsterMod, aber nicht den Inside-Buff
-//
-// - Buff+Cache bleibt als Fallback erhalten.
-// - Zeichnet On-Screen Marker und Edge-Pfeile.
-// - Pfeil kann auch angezeigt werden, wenn Monster bereits sichtbar ist.
-// - Pfeilrichtung wird dynamisch aus Player -> Monster berechnet,
-//   über einen projizierten Proxy-Punkt nahe beim Spieler.
-// - Tote/despawned Monster werden schneller aus dem Cache entfernt.
-// - Debug-Fenster mit MonsterMods und Buffs.
+// This version is meant to be used together with the PluginSDK.h tail-ABI fix
+// in sdk/PluginSDK.h.patch / tools/apply_sdk_fix.*.
 // ============================================================================
 
 #define NOMINMAX
 
 #include "sdk/PluginSDK.h"
-
-// Falls "imgui/imgui.h" nicht gefunden wird, nimm stattdessen: #include "imgui.h"
 #include "imgui/imgui.h"
 
 #include <algorithm>
@@ -39,7 +21,6 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace
@@ -103,8 +84,8 @@ namespace
     static bool IsUsableDirection(ImVec2 v)
     {
         return std::isfinite(v.x) &&
-            std::isfinite(v.y) &&
-            (std::abs(v.x) > 1.0f || std::abs(v.y) > 1.0f);
+               std::isfinite(v.y) &&
+               (std::abs(v.x) > 1.0f || std::abs(v.y) > 1.0f);
     }
 
     static ImVec2 ClampToScreenEdge(ImVec2 center, ImVec2 dir, float width, float height, float margin)
@@ -189,13 +170,14 @@ public:
 
     void OnEnable(bool /*isGameAttached*/) override
     {
-        if (ctx()->ImGuiContext)
+        if (HostCompatible() && ctx()->ImGuiContext)
             ImGui::SetCurrentContext(static_cast<ImGuiContext*>(ctx()->ImGuiContext));
 
         LoadSettings();
-
         m_EnableTime = std::chrono::steady_clock::now();
-        ctx()->Log.Info("Amanamu Void Alert enabled");
+
+        if (HostCompatible())
+            ctx()->Log.Info("Amanamu Void Alert enabled");
     }
 
     void OnDisable() override
@@ -203,7 +185,7 @@ public:
         SaveSettings();
         m_Tracked.clear();
 
-        if (ctx())
+        if (HostCompatible())
             ctx()->Log.Info("Amanamu Void Alert disabled");
     }
 
@@ -214,6 +196,11 @@ public:
 
     void DrawSettings() override
     {
+        // Der Host setzt den ImGui-Kontext f�r das Settings-Fenster bereits selbst.
+        // Hier NICHT ctx()->ImGuiContext setzen, sonst kann es nach SDK/ImGui-Updates crashen.
+        if (!ImGui::GetCurrentContext())
+            return;
+
         ImGui::Checkbox("Enable overlay", &m_EnableOverlay);
         ImGui::Checkbox("Show debug window", &m_ShowDebugWindow);
         ImGui::Checkbox("Draw on-screen labels", &m_DrawOnScreenLabels);
@@ -253,8 +240,14 @@ public:
 
     void DrawUI() override
     {
+        if (!HostCompatible())
+            return;
+
         if (ctx()->ImGuiContext)
             ImGui::SetCurrentContext(static_cast<ImGuiContext*>(ctx()->ImGuiContext));
+
+        if (!ImGui::GetCurrentContext())
+            return;
 
         if (!m_EnableOverlay && !m_ShowDebugWindow)
             return;
@@ -337,7 +330,6 @@ private:
 
             const std::string key = line.substr(0, eq);
             const std::string value = line.substr(eq + 1);
-
             const bool b = value == "1";
 
             try
@@ -360,7 +352,6 @@ private:
             }
             catch (...)
             {
-                // Ignore bad config values.
             }
         }
     }
@@ -409,7 +400,6 @@ private:
             return result;
 
         std::vector<PluginSDK::Buff> buffs = ctx()->Components.EnumerateBuffs(e.Components.Buffs);
-
         result.BuffNames.reserve(buffs.size());
 
         for (const PluginSDK::Buff& buff : buffs)
@@ -452,19 +442,15 @@ private:
                     static_cast<unsigned int>(mod.Hash32),
                     static_cast<int>(mod.GenerationType)
                 );
-
                 debugMods->push_back(line);
             }
 
             if (mod.Id == kExpectedMonsterModId)
                 found = true;
-
             if (mod.Metadata == kExpectedMonsterModMetadata)
                 found = true;
-
             if (mod.Hash16 == kExpectedMonsterModHash16)
                 found = true;
-
             if (mod.Hash32 == kExpectedMonsterModHash32)
                 found = true;
         }
@@ -489,15 +475,12 @@ private:
     {
         if (!projectionReturned)
             return;
-
         if (!std::isfinite(sx) || !std::isfinite(sy))
             return;
-
         if (std::abs(sx) > screenW * 4.0f || std::abs(sy) > screenH * 4.0f)
             return;
 
         ImVec2 dir(sx - screenCenter.x, sy - screenCenter.y);
-
         if (!IsUsableDirection(dir))
             return;
 
@@ -519,11 +502,9 @@ private:
         float screenH,
         ImVec2 screenCenter)
     {
-        // Wenn Monster sichtbar ist, ist die direkte Screenposition perfekt.
         if (visibleOnScreen)
         {
             ImVec2 dir(sx - screenCenter.x, sy - screenCenter.y);
-
             if (IsUsableDirection(dir))
             {
                 tracked.LastScreenDirection = Normalize(dir);
@@ -532,8 +513,6 @@ private:
             }
         }
 
-        // Wenn WorldToScreen für das Monster brauchbare Offscreen-Koordinaten liefert,
-        // können wir diese ebenfalls direkt benutzen.
         if (projectionReturned &&
             std::isfinite(sx) &&
             std::isfinite(sy) &&
@@ -541,7 +520,6 @@ private:
             std::abs(sy) < screenH * 4.0f)
         {
             ImVec2 dir(sx - screenCenter.x, sy - screenCenter.y);
-
             if (IsUsableDirection(dir))
             {
                 tracked.LastScreenDirection = Normalize(dir);
@@ -550,20 +528,15 @@ private:
             }
         }
 
-        // Haupt-Fallback:
-        // Richtung in der Welt berechnen: Player -> Monster.
         const float dx = worldX - snapshot.Player.WorldX;
         const float dy = worldY - snapshot.Player.WorldY;
-
         const float len = std::sqrt(dx * dx + dy * dy);
+
         if (len > 1.0f)
         {
             const float nx = dx / len;
             const float ny = dy / len;
 
-            // Proxy-Punkt nahe beim Spieler in Richtung Monster.
-            // Dadurch ist der Punkt fast immer projizierbar,
-            // auch wenn das Monster selbst offscreen ist.
             const float proxyX = snapshot.Player.WorldX + nx * m_ProxyDistance;
             const float proxyY = snapshot.Player.WorldY + ny * m_ProxyDistance;
             const float proxyZ = snapshot.Player.WorldZ + 80.0f;
@@ -597,7 +570,6 @@ private:
                 std::isfinite(proxySy))
             {
                 ImVec2 dir(proxySx - playerSx, proxySy - playerSy);
-
                 if (IsUsableDirection(dir))
                 {
                     tracked.LastScreenDirection = Normalize(dir);
@@ -607,7 +579,6 @@ private:
             }
         }
 
-        // Letzter Notfall-Fallback.
         if (tracked.HasLastScreenDirection)
             return Normalize(tracked.LastScreenDirection);
 
@@ -631,7 +602,6 @@ private:
 
             std::vector<std::string> monsterModDebug;
             const bool foundByMonsterMod = HasAmanamuMonsterMod(e, &monsterModDebug);
-
             const bool foundByBuff = buffResult.HasAnyLightlessWellBuff;
             const bool foundByStatsFallback = HasInterestingStatsFallback(e);
 
@@ -660,9 +630,7 @@ private:
 
             tracked.HasAmanamuMonsterMod = foundByMonsterMod || tracked.HasAmanamuMonsterMod;
             tracked.HasAnyLightlessBuff = buffResult.HasAnyLightlessWellBuff || tracked.HasAnyLightlessBuff;
-
             tracked.InsideCloud = buffResult.InsideCloud;
-
             tracked.LastBuffs = std::move(buffResult.BuffNames);
 
             if (!monsterModDebug.empty())
@@ -727,7 +695,6 @@ private:
             return;
 
         const ImVec2 screenCenter(screenW * 0.5f, screenH * 0.5f);
-
         std::vector<uint32_t> eraseAfterDraw;
 
         for (auto& [id, tracked] : m_Tracked)
@@ -738,7 +705,6 @@ private:
             if (hasLiveEntity)
             {
                 const PluginSDK::Entity& live = entityOpt.value();
-
                 if (live.MaxHP > 0 && live.CurrentHP <= 0)
                 {
                     eraseAfterDraw.push_back(id);
@@ -784,14 +750,12 @@ private:
                     tracked.InsideCloud = liveBuffResult.InsideCloud;
                     tracked.HasAnyLightlessBuff =
                         liveBuffResult.HasAnyLightlessWellBuff || tracked.HasAnyLightlessBuff;
-
                     tracked.LastBuffs = std::move(liveBuffResult.BuffNames);
                 }
             }
 
             float sx = 0.0f;
             float sy = 0.0f;
-
             const float markerZ = worldZ + std::max(modelBoundsZ, 80.0f);
 
             const bool projectionReturned = ctx()->Render.WorldToScreen(
@@ -831,24 +795,13 @@ private:
 
                 if (m_DrawOnScreenLabels)
                 {
-                    const char* state = tracked.InsideCloud
-                        ? "INSIDE CLOUD"
-                        : "OUTSIDE CLOUD";
+                    const char* state = tracked.InsideCloud ? "INSIDE CLOUD" : "OUTSIDE CLOUD";
 
                     char label[192];
-                    std::snprintf(
-                        label,
-                        sizeof(label),
-                        "AMANAMU VOID\n%s\n%.0f",
-                        state,
-                        tracked.Distance
-                    );
+                    std::snprintf(label, sizeof(label), "AMANAMU VOID\n%s\n%.0f", state, tracked.Distance);
 
                     const ImVec2 textSize = ImGui::CalcTextSize(label);
-                    const ImVec2 textPos(
-                        sx - textSize.x * 0.5f,
-                        sy - m_LabelYOffset - textSize.y
-                    );
+                    const ImVec2 textPos(sx - textSize.x * 0.5f, sy - m_LabelYOffset - textSize.y);
 
                     draw->AddText(ImVec2(textPos.x + 1.0f, textPos.y + 1.0f), textShadow, label);
                     draw->AddText(textPos, color, label);
@@ -876,30 +829,14 @@ private:
                     screenCenter
                 );
 
-                const ImVec2 arrowPos = ClampToScreenEdge(
-                    screenCenter,
-                    dir,
-                    screenW,
-                    screenH,
-                    m_ArrowEdgeMargin
-                );
-
+                const ImVec2 arrowPos = ClampToScreenEdge(screenCenter, dir, screenW, screenH, m_ArrowEdgeMargin);
                 DrawArrow(draw, arrowPos, dir, color);
 
                 char text[96];
-                std::snprintf(
-                    text,
-                    sizeof(text),
-                    "VOID %.0f %s",
-                    tracked.Distance,
-                    tracked.InsideCloud ? "IN" : "OUT"
-                );
+                std::snprintf(text, sizeof(text), "VOID %.0f %s", tracked.Distance, tracked.InsideCloud ? "IN" : "OUT");
 
                 const ImVec2 textSize = ImGui::CalcTextSize(text);
-                const ImVec2 textPos(
-                    arrowPos.x - textSize.x * 0.5f,
-                    arrowPos.y + 22.0f
-                );
+                const ImVec2 textPos(arrowPos.x - textSize.x * 0.5f, arrowPos.y + 22.0f);
 
                 draw->AddText(ImVec2(textPos.x + 1.0f, textPos.y + 1.0f), textShadow, text);
                 draw->AddText(textPos, color, text);
@@ -1060,10 +997,6 @@ private:
     std::chrono::steady_clock::time_point m_EnableTime{};
     std::unordered_map<uint32_t, TrackedMonster> m_Tracked;
 };
-
-// ============================================================================
-// SDK v6 factory exports
-// ============================================================================
 
 extern "C" PLUGIN_API PluginSDK::Plugin* CreatePlugin()
 {
