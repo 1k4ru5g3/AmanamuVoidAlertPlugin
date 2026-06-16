@@ -1812,6 +1812,22 @@ public:
         return m_abi->compute_screen_rect(addr, &x, &y, &w, &h) != 0;
     }
 
+    struct ScreenRect { float x = 0, y = 0, w = 0, h = 0; bool ok = false; };
+
+    // Batch variant of ComputeScreenRect. Returns one ScreenRect per input addr
+    // (same order). Empty / all-not-ok if the host is too old to provide it.
+    std::vector<ScreenRect> ComputeScreenRects(const std::vector<uintptr_t>& addrs) const {
+        std::vector<ScreenRect> out(addrs.size());
+        // compute_screen_rects lives on the HostAbi tail (see PluginAbi.h), so it
+        // is reached through m_host, not m_abi. Old hosts leave it null -> all not-ok.
+        if (!m_host || !m_host->compute_screen_rects || addrs.empty()) return out;
+        std::vector<PsdkScreenRectAbi> tmp(addrs.size());
+        m_host->compute_screen_rects(addrs.data(), static_cast<int32_t>(addrs.size()), tmp.data());
+        for (size_t i = 0; i < addrs.size(); ++i)
+            out[i] = { tmp[i].x, tmp[i].y, tmp[i].w, tmp[i].h, tmp[i].ok != 0 };
+        return out;
+    }
+
     uintptr_t GetGameUiRoot() const {
         return (m_abi && m_abi->get_game_ui_root) ? m_abi->get_game_ui_root() : 0;
     }
