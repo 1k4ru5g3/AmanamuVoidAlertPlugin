@@ -174,6 +174,7 @@ public:
             ImGui::SetCurrentContext(static_cast<ImGuiContext*>(ctx()->ImGuiContext));
 
         LoadSettings();
+
         m_EnableTime = std::chrono::steady_clock::now();
 
         if (HostCompatible())
@@ -196,10 +197,26 @@ public:
 
     void DrawSettings() override
     {
-        // Der Host setzt den ImGui-Kontext für das Settings-Fenster bereits selbst.
-        // Hier NICHT ctx()->ImGuiContext setzen, sonst kann es nach SDK/ImGui-Updates crashen.
+        // Important after recent POEFixer/SDK updates:
+        // The host already enters DrawSettings() with the correct ImGui context.
+        // Do NOT call ImGui::SetCurrentContext(ctx()->ImGuiContext) here; doing so
+        // can crash when the settings panel is drawn with a different/temporary
+        // ImGui context. DrawUI() still sets ctx()->ImGuiContext for overlay drawing.
         if (!ImGui::GetCurrentContext())
             return;
+
+        if (!HostCompatible())
+        {
+            ImGui::TextColored(
+                ImVec4(1.0f, 0.45f, 0.25f, 1.0f),
+                "Amanamu Void Alert: Host ABI mismatch"
+            );
+            ImGui::TextWrapped(
+                "The settings UI is available, but overlay/detection is disabled until "
+                "the plugin SDK and the running POEFixer host are compatible."
+            );
+            ImGui::Separator();
+        }
 
         ImGui::Checkbox("Enable overlay", &m_EnableOverlay);
         ImGui::Checkbox("Show debug window", &m_ShowDebugWindow);
